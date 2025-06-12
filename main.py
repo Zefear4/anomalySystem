@@ -5,18 +5,23 @@ import joblib
 import numpy as np
 from scapy.layers.inet import IP, TCP, UDP
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-import requests
-from threading import Thread
 import os
+import logging
+from datetime import datetime
 
 # Настройки системы
 INTERFACE = r'\Device\NPF_{E834C88A-01A5-485F-B061-200D93B6EBDF}'
 MODEL_DIR = 'saved_model'
 THRESHOLD = 0.95  # Порог для автоэнкодера
 
-# Настройки Telegram
-TELEGRAM_TOKEN = '7731072857:AAGh52DU5AupLt8hFo58j9dbtwkoScqkaV4'
-TELEGRAM_CHAT_ID = '5033781752'
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    filename='anomaly_detection.log',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filemode='a'  # режим добавления в конец файла
+)
+logger = logging.getLogger(__name__)
 
 # Уникальные значения признаков
 PROTO_VALUES = ['3pc', 'a/n', 'aes-sp3-d', 'any', 'argus', 'aris', 'arp', 'ax.25', 'bbn-rcc', 'bna',
@@ -37,30 +42,6 @@ PROTO_VALUES = ['3pc', 'a/n', 'aes-sp3-d', 'any', 'argus', 'aris', 'arp', 'ax.25
 SERVICE_VALUES = ['-', 'dhcp', 'dns', 'ftp', 'ftp-data', 'http', 'irc', 'pop3', 'radius', 'smtp', 'snmp', 'ssh', 'ssl']
 
 STATE_VALUES = ['CON', 'ECO', 'FIN', 'INT', 'PAR', 'REQ', 'RST', 'URN', 'no']
-
-
-# Класс для отправки уведомлений в Telegram
-class TelegramNotifier:
-    def __init__(self):
-        self.token = TELEGRAM_TOKEN
-        self.chat_id = TELEGRAM_CHAT_ID
-        self.base_url = f"https://api.telegram.org/bot{self.token}"
-
-    def send_message(self, text):
-        url = f"{self.base_url}/sendMessage"
-        params = {
-            'chat_id': self.chat_id,
-            'text': text,
-            'parse_mode': 'HTML'
-        }
-        try:
-            Thread(target=requests.get, args=(url,), kwargs={'params': params}).start()
-        except Exception as e:
-            print(f"Ошибка отправки в Telegram: {e}")
-
-
-# Инициализация Telegram-бота
-telegram_notifier = TelegramNotifier()
 
 
 # Загрузка моделей
@@ -88,7 +69,7 @@ def load_models():
 
         return rf_model, autoencoder, scaler, encoders
     except Exception as e:
-        print(f"Ошибка загрузки моделей: {e}")
+        logger.error(f"Ошибка загрузки моделей: {e}")
         raise
 
 
@@ -172,7 +153,7 @@ def preprocess_features(stats):
 
         return scaler.transform([features])
     except Exception as e:
-        print(f"Ошибка предобработки признаков: {e}")
+        logger.error(f"Ошибка предобработки признаков: {e}")
         return None
 
 
@@ -193,47 +174,36 @@ def analyze_with_autoencoder(features):
 
 
 def log_anomaly(conn_id, stats, detector_type):
-    """Логирование и отправка оповещения об аномалии"""
+    """Логирование аномалии в файл"""
     src_ip, dst_ip, sport, dport, _ = conn_id
 
-    # Формируем детализированное сообщение
-    message = f"""
-🚨 <b>Обнаружена аномалия ({detector_type})</b>
+    # Формируем детализированное сообщение для лога
+    log_message = (
+        f"Обнаружена аномалия ({detector_type})\n"
+        f"Соединение: {src_ip}:{sport} → {dst_ip}:{dport}\n"
+        f"Протокол: {stats['proto']}, Сервис: {stats['service']}, Состояние: {stats['state']}\n"
+        f"Длительность: {stats['dur']:.2f} сек\n"
+        f"Пакеты: {stats['spkts']} исх. / {stats['dpkts']} вх.\n"
+        f"Байты: {stats['sbytes']:,} исх. / {stats['dbytes']:,} вх.\n"
+        f"Скорость: {stats['rate']:.2f} пак/сек\n"
+        f"Нагрузка: {stats['sload']:.2f} / {stats['dload']:.2f} байт/сек\n"
+        f"TTL: {stats['sttl']:.1f} исх. / {stats['dttl']:.1f} вх.\n"
+        f"Интервал пакетов: {stats['sinpkt']:.5f} / {stats['dinpkt']:.5f} сек\n"
+        f"Джиттер: {stats['sjit']:.5f} / {stats['djit']:.5f} сек\n"
+        f"TCP-окно: {stats['swin']:.1f} / {stats['dwin']:.1f}\n"
+        f"Соединений от источника: {stats['ct_srv_src']}\n"
+        f"Соединений к назначению: {stats['ct_srv_dst']}\n"
+        f"{'='*50}"
+    )
 
-<b>Основные параметры:</b>
-├─ Соединение: <code>{src_ip}:{sport} → {dst_ip}:{dport}</code>
-├─ Протокол: <code>{stats['proto']}</code>
-├─ Сервис: <code>{stats['service']}</code>
-├─ Состояние: <code>{stats['state']}</code>
-└─ Длительность: <code>{stats['dur']:.2f} сек</code>
-
-<b>Статистика трафика:</b>
-├─ Пакеты: <code>{stats['spkts']} исх. / {stats['dpkts']} вх.</code>
-├─ Байты: <code>{stats['sbytes']:,} исх. / {stats['dbytes']:,} вх.</code>
-├─ Скорость: <code>{stats['rate']:.2f} пак/сек</code>
-├─ Нагрузка: <code>{stats['sload']:.2f} / {stats['dload']:.2f} байт/сек</code>
-└─ TTL: <code>{stats['sttl']:.1f} исх. / {stats['dttl']:.1f} вх.</code>
-
-<b>Временные характеристики:</b>
-├─ Интервал пакетов: <code>{stats['sinpkt']:.5f} / {stats['dinpkt']:.5f} сек</code>
-└─ Джиттер: <code>{stats['sjit']:.5f} / {stats['djit']:.5f} сек</code>
-
-<b>TCP-параметры:</b>
-└─ Размер окна: <code>{stats['swin']:.1f} / {stats['dwin']:.1f}</code>
-
-<b>Контекстные метрики:</b>
-├─ Соединений от источника: <code>{stats['ct_srv_src']}</code>
-└─ Соединений к назначению: <code>{stats['ct_srv_dst']}</code>
-"""
+    # Логируем аномалию
+    logger.warning(log_message)
 
     # Вывод в консоль (сокращенная версия)
     print(f"\n[!] Обнаружена аномалия ({detector_type})")
     print(f"Соединение: {src_ip}:{sport} -> {dst_ip}:{dport}")
     print(f"Протокол: {stats['proto']}, Сервис: {stats['service']}")
     print(f"Пакеты: {stats['spkts']}/{stats['dpkts']}, Байты: {stats['sbytes']}/{stats['dbytes']}")
-
-    # Отправка в Telegram
-    telegram_notifier.send_message(message)
 
 
 def process_connection(conn_id, stats):
@@ -253,7 +223,7 @@ def process_connection(conn_id, stats):
             log_anomaly(conn_id, stats, "Autoencoder")
 
     except Exception as e:
-        print(f"Ошибка анализа соединения: {e}")
+        logger.error(f"Ошибка анализа соединения: {e}")
 
 
 def process_packet(packet):
@@ -361,9 +331,9 @@ def process_packet(packet):
 
             # Подсчет соединений
             stats['ct_srv_src'] = sum(1 for conn in connection_stats
-                                      if conn[0] == src_ip and conn[3] == dport)
+                                    if conn[0] == src_ip and conn[3] == dport)
             stats['ct_srv_dst'] = sum(1 for conn in connection_stats
-                                      if conn[1] == dst_ip and conn[2] == sport)
+                                    if conn[1] == dst_ip and conn[2] == sport)
 
             # Анализ соединения
             process_connection(conn_id, stats)
@@ -372,25 +342,24 @@ def process_packet(packet):
             del connection_stats[conn_id]
 
     except Exception as e:
-        print(f"Ошибка обработки пакета: {e}")
+        logger.error(f"Ошибка обработки пакета: {e}")
 
 
 def start_detection():
     print("Запуск гибридной системы обнаружения аномалий...")
     print(f"Интерфейс: {INTERFACE}")
+    print(f"Логирование в файл: anomaly_detection.log")
     print("Нажмите Ctrl+C для остановки")
 
-    # Отправляем уведомление о запуске системы
-    telegram_notifier.send_message("🟢 Система обнаружения аномалий запущена")
+    logger.info("Система обнаружения аномалий запущена")
 
     try:
         sniff(iface=INTERFACE, prn=process_packet, store=0)
     except KeyboardInterrupt:
         print("\nОстановка системы обнаружения")
-        telegram_notifier.send_message("🔴 Система обнаружения аномалий остановлена")
+        logger.info("Система обнаружения аномалий остановлена")
     except Exception as e:
-        print(f"Ошибка в системе: {e}")
-        telegram_notifier.send_message(f"🔴 Критическая ошибка: {str(e)}")
+        logger.error(f"Критическая ошибка: {str(e)}")
         raise
 
 
